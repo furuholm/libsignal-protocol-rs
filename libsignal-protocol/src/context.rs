@@ -2,7 +2,7 @@ use std::{
     convert::TryFrom,
     fmt::{self, Debug, Formatter},
     os::raw::{c_char, c_int, c_void},
-    panic::RefUnwindSafe,
+    panic::{RefUnwindSafe},
     pin::Pin,
     ptr,
     rc::Rc,
@@ -13,7 +13,7 @@ use std::{
 use failure::Error;
 use lock_api::RawMutex as _;
 use log::Level;
-use parking_lot::RawMutex;
+use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
 
 #[cfg(feature = "crypto-native")]
 use crate::crypto::DefaultCrypto;
@@ -333,7 +333,8 @@ impl ContextInner {
             let mut global_context: *mut sys::signal_context = ptr::null_mut();
             let crypto = CryptoProvider::new(crypto);
             let mut state = Pin::new(Box::new(State {
-                mux: RawMutex::INIT,
+                mux: ReentrantMutex::new(()),
+                guards: Default::default(),
                 log_func: Mutex::new(Box::new(default_log_func)),
             }));
 
@@ -407,8 +408,8 @@ unsafe extern "C" fn log_trampoline(
     if let Ok(message) = std::str::from_utf8(buffer) {
         // we can't log the errors that occur while logging errors, so just
         // drop them on the floor...
+        let log_func = state.log_func.lock().unwrap();
         let _ = std::panic::catch_unwind(|| {
-            let log_func = state.log_func.lock().unwrap();
             log_func(level, message);
         });
     }
@@ -426,13 +427,14 @@ fn translate_log_level(raw: c_int) -> Level {
 }
 
 unsafe extern "C" fn lock_function(user_data: *mut c_void) {
-    let state = &*(user_data as *const State);
-    state.mux.lock();
+    let state = &mut *(user_data as *mut State);
+    let guard = state.mux.lock();
+    state.guards.push(guard);
 }
 
 unsafe extern "C" fn unlock_function(user_data: *mut c_void) {
-    let state = &*(user_data as *const State);
-    state.mux.unlock();
+    let state = &mut *(user_data as *mut State);
+    state.guards.pop();
 }
 
 /// The "user state" we pass to `libsignal-protocol-c` as part of the global
@@ -444,7 +446,8 @@ unsafe extern "C" fn unlock_function(user_data: *mut c_void) {
 /// `libsignal-protocol-c` library, so any mutation **must** be done using the
 /// appropriate synchronisation mechanisms (i.e. `RefCell` or atomics).
 struct State {
-    mux: RawMutex,
+    mux: ReentrantMutex<()>,
+    guards: Vec<ReentrantMutexGuard<'static, ()>>,
     log_func: Mutex<Box<dyn Fn(Level, &str) + RefUnwindSafe>>,
 }
 
