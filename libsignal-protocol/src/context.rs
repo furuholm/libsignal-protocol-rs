@@ -332,11 +332,7 @@ impl ContextInner {
         unsafe {
             let mut global_context: *mut sys::signal_context = ptr::null_mut();
             let crypto = CryptoProvider::new(crypto);
-            let mut state = Pin::new(Box::new(State {
-                mux: ReentrantMutex::new(()),
-                guards: Default::default(),
-                log_func: Mutex::new(Box::new(default_log_func)),
-            }));
+            let mut state = Pin::new(Box::new(State::new()));
 
             let user_data =
                 state.as_mut().get_mut() as *mut State as *mut c_void;
@@ -451,9 +447,39 @@ struct State {
     log_func: Mutex<Box<dyn Fn(Level, &str) + RefUnwindSafe>>,
 }
 
+impl State {
+    fn new() -> State {
+        State {
+            mux: ReentrantMutex::new(()),
+            guards: Default::default(),
+            log_func: Mutex::new(Box::new(default_log_func)),
+        }
+    }
+}
+
+/// Implement Send to allow sending it accross thread boundries.
+/// https://doc.rust-lang.org/stable/nomicon/send-and-sync.html
+///
+/// # Safety
+///
+/// A pointer to this [`State`] will be shared throughout the
+/// `libsignal-protocol-c` library, so any mutation **must** be done using the
+/// appropriate synchronisation mechanisms (i.e. `RefCell` or atomics).
+unsafe impl Send for State {}
+
+/// Implement Sync to allow sending it accross thread boundries.
+///
+/// # Safety
+///
+/// A pointer to this [`State`] will be shared throughout the
+/// `libsignal-protocol-c` library, so any mutation **must** be done using the
+/// appropriate synchronisation mechanisms (i.e. `RefCell` or atomics).
+unsafe impl Sync for State {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::Arc, thread};
 
     #[cfg(feature = "crypto-native")]
     #[test]
@@ -470,5 +496,76 @@ mod tests {
         let ctx = Context::new(OpenSSLCrypto::default()).unwrap();
 
         drop(ctx);
+    }
+
+    #[test]
+    fn smoke() {
+        let mut state = State::new();
+        let user_data = &mut state as *mut _ as *mut c_void;
+        {
+            unsafe {
+                lock_function(user_data);
+                lock_function(user_data);
+                lock_function(user_data);
+                unlock_function(user_data);
+                unlock_function(user_data);
+                unlock_function(user_data);
+            }
+        }
+    }
+
+    #[test]
+    fn mutex() {
+        // Aquire lock
+        fn lock(state: &Arc<Mutex<State>>) {
+            unsafe {
+                let user_data =
+                    &mut *state.lock().unwrap() as *mut _ as *mut c_void;
+                lock_function(user_data);
+            }
+        }
+        // Release lock
+        fn unlock(state: &Arc<Mutex<State>>) {
+            unsafe {
+                let user_data =
+                    &mut *state.lock().unwrap() as *mut _ as *mut c_void;
+                unlock_function(user_data);
+            }
+        }
+
+        let state = Arc::new(Mutex::new(State::new()));
+        let counter = Arc::new(Mutex::new(0));
+
+        // Clone state and counter to allow them to be moved to
+        // another thread.
+        let state_clone = state.clone();
+        let counter_clone = counter.clone();
+
+        // Lock before starting the other thread.
+        lock(&state);
+
+        let t = thread::spawn(move || {
+            // Aquire lock. It should block until the last unlock
+            // in the spawnee thread has been invoked.
+            lock(&state_clone);
+            unlock(&state_clone);
+            assert_eq!(210, *counter_clone.lock().unwrap());
+        });
+        // THIS CAUSES DEADLOCK SINCE LOCKING OF state_clone (in fn lock(...)) 
+        // WILL PREVENT LOCKING OF state BELOW.
+        thread::sleep_ms(100);
+        // Lock and unlock recursively
+        for i in 1..11 {
+            lock(&state);
+            *counter.lock().unwrap() += i;
+        }
+        for i in 11..21 {
+            *counter.lock().unwrap() += i;
+            unlock(&state);
+        }
+        // Unlock a last time to match the initial lock.
+        unlock(&state);
+        // Wait for the other thread to finish.
+        t.join().unwrap();
     }
 }
